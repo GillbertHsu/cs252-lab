@@ -1,0 +1,33 @@
+PART 2
+
+In step 2, the output will randomly be 'A', 'B', or 'C' without pattern, but sometimes there can be consecutive 'A', 'B', or 'C'
+
+In step 4, the output will only be 'C' because the function printC("C") is not ended, and thread t1 and t2 will not be created. 
+-----------------------------------------------------------------------------------------------------------------------------------------------
+PART 4
+
+---------------------------------------------------------------------------------------
+|                                         | Sys time    | User time    | Real time    |
+---------------------------------------------------------------------------------------
+| pthread_mutex (count)                   | 0.394s      | 1.297s       | 0.871s       |
+---------------------------------------------------------------------------------------
+| spin lock(count_spin with thr_yield)    | 0.080s      | 0.359s       | 0.247s       |
+---------------------------------------------------------------------------------------
+| spin_lock(count_spin without thr_yield) | 0.000s      | 1.777s       | 0.950s       |
+---------------------------------------------------------------------------------------
+
+1. The user time of count_spin without thr_yield is longer than count_spin with thr_yield because count_spin without thr_yield 
+   stay in user mode most of the time and don't need to spend time in system to yield the thread.
+   
+2. The system time of count is longer than the time count_spin with thr_yield in system because mutex needs to switch the process
+   in kernel mode. Also, the slide says thr_yield give up the cpu but not entirely, so we can find out that count_spin with thr_yield
+   still spend some time in system.
+------------------------------------------------------------------------------------------------------------------------------------------------- 
+PART 7
+
+1. \xef\xbe\xad\xde
+
+2. ./buffer `printf "111111111111111\xef\xbe\xad\xde"`
+
+3. the first 15 '1' is to cause the overflow, and I convert 0xdeadbeef to decimal and then convert that decimal to little endian hex.
+
