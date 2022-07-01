@@ -1,0 +1,336 @@
+const char * usage =
+"                                                             \n"
+"myhttpd-server:                                              \n"
+"                                                             \n"
+"                                                             \n"
+"To use it in one window type:                                \n"
+"                                                             \n"
+"   myhttpd  [-f|-t|-p] <port>                                \n"
+"                                                             \n"
+"Where 1024 < port < 65536.                                   \n"
+"                                                             \n"
+"In browser like chrome type:                                 \n"
+"                                                             \n"
+"    <host> <port>                                            \n"
+"                                                             \n"
+"where <host> is the name of the machine where myhttpd-server \n"
+"is running. <port> is the port number you used when you run  \n"
+"myhttpd-server.                                              \n"
+"                                                             \n"
+"                                                             \n";
+
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netdb.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <time.h>
+#include <dirent.h>
+#include <sys/wait.h>
+#include <string>
+#include <cstdio>
+#include <signal.h>
+#include <fcntl.h>
+
+
+
+
+
+extern "C" void backgroundHandler(int zombie){
+  while (waitpid(-1, NULL, WNOHANG) > 0) {}
+}
+
+int QueueLength = 5;
+char user_pwd[100] = "Z2lsYmVydDoxMjM0NTY3OA==";
+pthread_mutex_t mutex;
+
+// Processes time request
+void processHTTPRequest( int socket );
+char * getContentType(char * filename);
+void poolSlave(int socket);
+void processRequestThread(int socket);
+
+int main( int argc, char ** argv )
+{
+  // Print usage if not enough arguments
+  if ( argc < 2 ) {
+    fprintf( stderr, "%s", usage );
+    exit( -1 );
+  }
+
+  int port = 9098;
+  char flag = 0;
+
+  // Get the port from the arguments
+  if (argc == 2) {
+    port = atoi( argv[1] );
+  }
+
+  if (argc == 3) {
+    flag = argv[1][1];
+    port = atoi( argv[2] );
+  }
+  
+  // Set the IP address and port for this server
+  struct sockaddr_in serverIPAddress; 
+  memset( &serverIPAddress, 0, sizeof(serverIPAddress) );
+  serverIPAddress.sin_family = AF_INET;
+  serverIPAddress.sin_addr.s_addr = INADDR_ANY;
+  serverIPAddress.sin_port = htons((u_short) port);
+  
+  // Allocate a socket
+  int masterSocket =  socket(PF_INET, SOCK_STREAM, 0);
+  if ( masterSocket < 0) {
+    perror("socket");
+    exit( -1 );
+  }
+
+  // Set socket options to reuse port. Otherwise we will
+  // have to wait about 2 minutes before reusing the sae port number
+  int optval = 1; 
+  int err = setsockopt(masterSocket, SOL_SOCKET, SO_REUSEADDR, 
+		       (char *) &optval, sizeof( int ) );
+   
+  // Bind the socket to the IP address and port
+  int error = bind( masterSocket,
+		    (struct sockaddr *)&serverIPAddress,
+		    sizeof(serverIPAddress) );
+  if ( error ) {
+    perror("bind");
+    exit( -1 );
+  }
+  
+  // Put socket in listening mode and set the 
+  // size of the queue of unprocessed connections
+  error = listen( masterSocket, QueueLength);
+  if ( error ) {
+    perror("listen");
+    exit( -1 );
+  }
+
+  if (flag == 'p') {
+    pthread_t tid[QueueLength];
+    pthread_mutex_init(&mutex, NULL);
+    for(int i = 0; i < QueueLength; i++) {
+      pthread_create(&tid[i], NULL, (void *(*)(void *))poolSlave, (void *)masterSocket);
+    }
+    pthread_join(tid[0], NULL);
+  } else {
+    while ( 1 ) {
+      // Accept incoming connections
+      struct sockaddr_in clientIPAddress;
+      int alen = sizeof( clientIPAddress );
+      int slaveSocket = accept( masterSocket,
+			        (struct sockaddr *)&clientIPAddress,
+			        (socklen_t*)&alen);
+
+
+      if ( slaveSocket < 0 ) {
+        perror( "accept" );
+        exit( -1 );
+      }
+      // Process request.
+      if (flag == 'f') {
+        struct sigaction sa; //deal with zombie process
+        sa.sa_handler = backgroundHandler;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = SA_RESTART;
+        pid_t slave = fork();
+        if (slave == 0) {
+          processHTTPRequest(slaveSocket);
+          exit(0);
+        } else {
+          int zombie = sigaction(SIGCHLD, &sa, NULL);
+          if (zombie) {
+            perror("sigaction");
+            exit(-1);
+          } else {
+            close(slaveSocket);
+          }
+        }
+      } else if (flag == 't') {
+        pthread_t t1;
+        pthread_attr_t attr;
+        pthread_attr_init( &attr );
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        pthread_create(&t1, &attr, (void *(*)(void *))processRequestThread, (void *)slaveSocket);
+      } else {
+        processHTTPRequest( slaveSocket );
+      }
+      
+      //Close socket
+      //close( slaveSocket );
+    }
+  }
+
+  return 0;
+}
+
+void
+processHTTPRequest( int fd )
+{
+  // Buffer used to store the document received from the client
+  const int Max = 4096;
+  char curr_string[ Max + 1 ];
+  char docPath[ Max + 1 ];
+  int curr_stringLength = 0;
+  int n;
+
+  // Currently character read
+  unsigned char newChar;
+
+  // Last character read
+  unsigned char lastChar = 0;
+
+  
+  // The client should send GET <sp> <Document Requested> <sp> HTTP/1.0 <crlf> 
+  // Read the name of the client character by character until a
+  // <crlf> is found.
+  int get = 0;
+  int autho = 0;
+  int pass = 0;
+
+  
+  while ((curr_stringLength < Max) && (n = read(fd, &newChar, sizeof(newChar))) > 0) {
+    curr_string[ curr_stringLength ] = newChar;
+    curr_stringLength++;
+    
+    if ( curr_stringLength > 4 && curr_string[curr_stringLength -4] == '\r' && curr_string[curr_stringLength -3] == '\n' 
+      && curr_string[curr_stringLength -2] == '\r' && curr_string[curr_stringLength -1] == '\n') {
+        break;
+    }
+  }
+  curr_string[curr_stringLength] = 0;
+  printf("%s\n", curr_string);
+
+  std::string request = curr_string;
+  
+  int GET = request.find("GET");
+  int first_space = request.find(" ", GET);
+  int second_space = request.find(" ", first_space + 1);
+  std::string tmp = request.substr(first_space + 1, second_space - first_space - 1);
+  strcpy(docPath, tmp.c_str());
+  
+  if (request.find("GET") != -1) {
+    get = 1;
+  }
+  if (request.find("Authorization: Basic") != -1) {
+    autho = 1;
+  }
+
+  if (autho == 1) {
+    if (strcmp(user_pwd, request.substr(request.find("Authorization: Basic") + 21, strlen("Z2lsYmVydDoxMjM0NTY3OA==")).c_str()) == 0) {
+      pass = 1;
+    } 
+  }
+
+  if ( (get == 1 && autho == 0) || pass == 0) {
+    // Send the error message
+    const char *realm = "\"myhttpd-cs252\"";
+    write(fd, "HTTP/1.1 401 Unaothorized\r\n", 27);
+    write(fd, "WWW-Authenticate: Basic realm=", 30);
+    write(fd, realm, strlen(realm));
+    write(fd, "\r\n\r\n", 4);
+  }
+  if (pass = 1) {
+    char cwd[256]; 
+    getcwd(cwd, sizeof(cwd)); 
+    char realPath[Max];
+    if (strncmp("/icons",docPath, 6) == 0) {
+      sprintf(realPath,"%s/http-root-dir%s", cwd, docPath);
+    } else if (strncmp("/htdocs" ,docPath, 7) == 0) {
+      sprintf(realPath,"%s/http-root-dir%s", cwd, docPath);
+    } else if (strcmp(docPath, "/") == 0 || strlen(docPath) == 0) {
+      sprintf(realPath,"%s/http-root-dir/htdocs/index.html", cwd);
+    } else {
+      sprintf(realPath,"%s/http-root-dir/htdocs%s", cwd, docPath);
+    }
+    printf("file path: %s\n", realPath);
+    std::string filePath = realPath;
+    FILE *fp = fopen(filePath.c_str(), "r");
+    if (fp == NULL) {
+      write(fd, "HTTP/1.1 404 File Not Found\r\n", strlen("HTTP/1.1 404 File Not Found\r\n"));
+      write(fd, "Server: CS 252 lab5\r\n", 21);
+      write(fd, "Content-type: text/html\r\n\r\n", 27);
+      const char doc[] = "<html><head><title>404 Not Found</title>"
+                          "</head><body><h1>404 Not Found</h1></body></html>";
+      write(fd, doc , strlen(doc));
+    } else {
+      write(fd, "HTTP/1.1 200 Document follows\r\n", strlen("HTTP/1.1 200 Document follows\r\n"));
+      write(fd, "Server: CS252 lab5\r\n", strlen("Server: CS252 lab5\r\n"));
+      write(fd, "Content-Type: ", 14);
+      const char * content_type = getContentType(realPath);
+      write(fd, content_type, strlen(content_type));
+      write(fd, "\r\n\r\n", 4);
+      char document[Max];
+      size_t nread;
+      while ((nread = fread(document, 1, sizeof(document), fp)) > 0) {
+        write(fd, document, nread);
+      }
+      fclose(fp);
+    }
+  }
+  close( fd );
+}
+
+char * getContentType(char * filename) {
+  std::string file = filename;
+  if (file.find(".html") != -1) {
+    return "text/html";
+  } else if (file.find(".gif") != -1) {
+    return "image/gif";
+  } else if (file.find(".svg") != -1) {
+    return "image/svg+xml";
+  } else if (file.find(".png") != -1) {
+    return "image/png";
+  } else {
+    return "text/plain";
+  }
+}
+
+void poolSlave(int masterSocket) {
+  while(1){ 
+    struct sockaddr_in clientIPAddress;
+    int alen = sizeof( clientIPAddress );
+    int slaveSocket = accept( masterSocket,
+			      (struct sockaddr *)&clientIPAddress,
+			      (socklen_t*)&alen);
+
+    if ( slaveSocket < 0 ) {
+      perror( "accept" );
+      exit( -1 );
+    }
+    processHTTPRequest(slaveSocket);
+    //close(slaveSocket);
+  }
+}
+
+void processRequestThread(int socket) { 
+  processHTTPRequest(socket); 
+}
+============================================================================
+
+jj-mod: jj-mod.c
+	$(CC) -c -fPIC -o $@.o jj-mod.c
+
+util: util.c
+	$(CC) -c -fPIC -o $@.o util.c
+
+jj-mod.so: jj-mod.o util.o
+	ld -G -o jj-mod.so jj-mod.o util.o
+
+==============================================================================
+jj-mod: jj-mod.c
+	$(CC) -c -fPIC -o $@.o jj-mod.c
+
+util: util.c
+	$(CC) -c -fPIC -o $@.o util.c
+
+jj-mod.so: jj-mod.o util.o
+	ld -G -o jj-mod.so jj-mod.o util.o -g
+	cp jj-mod.so http-root-dir/cgi-bin/jj-mod.so
+  --------------------------------------------------------------------------
